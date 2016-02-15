@@ -1,0 +1,208 @@
+#!/bin/sh
+#|-*- mode:lisp -*-|#
+#|
+exec ros -Q -- $0 "$@"
+|#
+(defpackage :ros.script.qlfile
+  (:use :cl))
+(in-package :ros.script.qlfile)
+
+(ql:quickload '(:qlot :dexador :cl-ppcre) :silent t)
+
+(defun parse-line (line)
+  (let ((pos (position-if (lambda (x) (member x '(#\; #\#))) line)))
+    (list (when pos (list pos (subseq line pos)))
+          (uiop/utility:split-string (string-right-trim " " (subseq line 0 pos))))))
+
+(defun tabless-read-line (stream)
+  (let ((line (read-line stream nil nil)))
+    (when line
+      (with-output-to-string (o)
+        (loop for i across line
+           do (format o "~A" (if (eql i #\tab)
+                                 "        "
+                                 i)))))))
+
+(defun read-qlfile (file)
+  (with-open-file (in file)
+    (loop for line = (tabless-read-line in)
+       while line
+       collect (parse-line line))))
+
+;; structure of line would have structure like below. it depends it has comment or not
+;;   (({int indent till comment} {str comment body}) {list body})
+;;   (nil {list body})
+;; body is list of strings.
+(defun serialize-line (line stream)
+  (let ((str (format nil "~{~A~^ ~}" (second line))))
+    (if (car line)
+        (format stream "~vA~A~%" (caar line) str (cadar line))
+        (format stream "~A~%" str))))
+
+(defun write-qlfile (sexp file)
+  (with-open-file (o file :direction :output :if-exists :supersede :if-does-not-exist :create)
+    (dolist (line sexp)
+      (serialize-line line o))))
+
+(defun find-qlfile (string qlfile)
+  (find string qlfile
+        :key #'(lambda (x) (second (second x)))
+        :test #'string-equal))
+
+(defun remove-qlfile (string qlfile)
+  (remove string qlfile
+          :key #'(lambda (x) (second (second x)))
+          :test #'string-equal))
+
+(defun ql-list ()
+  "to muffle output don't use ql-dist:available-versions"
+  (with-input-from-string (i (dex:get (ql-dist:available-versions-url (ql-dist:dist "quicklisp"))))
+    (nreverse
+     (loop for line = (read-line i nil nil)
+        while line
+        collect (subseq line 0 (position #\space line))))))
+
+(defparameter *context* :global)
+
+(defun command-name (name)
+  (intern (format nil "~(~A~)-~A" *context* name) :keyword))
+
+(defun option-name (name)
+  (intern (format nil "~(~A~)/~A" *context* name) :keyword))
+
+(defun invoke (gf arg &optional (context *context*))
+  (setf *context* context)
+  (loop
+     with opt-p and arg-
+     do (multiple-value-setq (opt-p context arg-)
+          (funcall gf (option-name (first arg)) (first arg) (rest arg)))
+     while opt-p
+     do (setf *context* context
+              arg arg-))
+  (funcall gf (command-name (first arg)) (first arg) (rest arg)))
+
+(defmacro definvokable (symbol)
+  (let ((cmd (make-symbol (string :cmd)))
+        (subcmd (make-symbol (string :subcmd)))
+        (argv (make-symbol (string :argv)))
+        (body (make-symbol (string :body)))
+        (symb (make-symbol (string :symb))))
+    `(progn
+       (defgeneric ,symbol (,cmd ,subcmd ,argv))
+       (defmacro ,(intern (format nil "~A~A" :def symbol)) (,symb lambda-list &body ,body)
+         (if (first ,symb)
+             `(defmethod ,',symbol ((,',cmd (eql ,(command-name (first ,symb)))) ,',subcmd ,',argv)
+                (apply (lambda ,lambda-list
+                         ,@,body) ,',subcmd ,',argv))
+             `(defmethod ,',symbol (,',cmd  ,',subcmd ,',argv)
+                (unless (find #\/ (string ,',cmd))
+                  (apply (lambda ,lambda-list
+                           ,@,body) ,',subcmd ,',argv))))))))
+(definvokable name)
+
+(defname () (sub &rest argv)
+  (declare (ignorable sub argv)))
+
+(definvokable command)
+
+(defcommand () (sub &rest argv)
+  "default command"
+  (declare (ignorable argv))
+  (format *error-output* "~A is not command" sub)
+  (ros:quit 1))
+
+(defcommand ("init") (subcmd &rest argv)
+  (declare (ignore subcmd))
+  (if (probe-file "qlfile")
+      (format *error-output* "qlfile already exists~%")
+      (write-qlfile `((nil ("ql" ":all" ,(first (ql-list))))) "qlfile"))
+  argv)
+  
+(defcommand ("rm") (subcmd &rest argv)
+  (declare (ignore subcmd))
+  (let ((qlfile (read-qlfile "qlfile"))
+        (name (first argv)))
+    (if (find-qlfile name qlfile)
+        (write-qlfile (remove-qlfile name qlfile) "qlfile")
+        (format *error-output* "~A is not in the qlfile list.~%" name))))
+
+(defcommand ("add") (subcmd &rest argv)
+  (declare (ignore subcmd))
+  (setq *context* :add)
+  (let* ((qlfile (read-qlfile "qlfile"))
+         (name (invoke 'name argv))
+         (to-mod (find-qlfile name qlfile))
+         (found (not (not to-mod))))
+    (when name
+      (unless found
+        (setq to-mod `(nil (nil ,name))
+              qlfile (nconc qlfile (list to-mod))))
+      (setf (second to-mod) (invoke 'command argv))
+      (write-qlfile qlfile"qlfile"))))
+
+(defparameter *context* :add)
+
+(defname ("http") (subcmd &rest argv)
+  (declare (ignore subcmd))
+  (first argv))
+
+(defcommand ("http") (subcmd &rest argv)
+  (cons subcmd argv))
+
+(defname ("ql") (subcmd &rest argv)
+  (declare (ignore subcmd))
+  (first argv))
+
+(defcommand ("ql") (subcmd &rest argv)
+  (cons subcmd argv))
+
+(labels ((name (argv)
+           "should be implemented as alias?"
+           (or (first (loop for (a b) on (rest argv) by #'cddr
+                         :when (equal a ":name")
+                collect b))
+               (aref (nth-value 1 (cl-ppcre:scan-to-strings "/([^/]+?)(?:.git)?/?$" (first argv)))0)))
+         (rem-name (argv)
+           (loop for (a b) on (rest argv) by #'cddr
+              for c = (equal a ":name")
+              unless c
+              collect a
+              unless c
+              collect b)))
+  (defname ("git") (subcmd &rest argv)
+    (declare (ignore subcmd))
+    (name argv))
+  (defname ("github") (subcmd &rest argv)
+    (declare (ignore subcmd))
+    (name argv))
+  (defcommand ("git") (subcmd &rest argv)
+    `(,subcmd ,(name argv) ,(first argv) ,@(rem-name argv)))
+  (defcommand ("github") (subcmd &rest argv)
+    `(,subcmd ,(name argv) ,(first argv) ,@(rem-name argv))))
+
+(defun main (&rest argv)
+  (setq *context* :global)
+  (invoke 'command argv))
+
+#| implementation memo...
+qlfile init
+qlfile rm project-name
+qlfile add http project-name url [md5]
+qlfile add ql project-name [<version>| :latest]
+qlfile add ql :all [<version>| :latest]
+qlfile add git repo [:ref <commit ref>|:branch <branch name>|:tag <tag name>] [:name <project-name>]
+qlfile add github repo [:ref <commit ref>|:branch <branch name>|:tag <tag name>] [:name <project-name>]
+
+;; not yet implemented features for shell completion.
+qlfile completion -> (or init rm add)
+qlifle completion init -> nil
+qlfile completion rm -> (projects) ;; how to deal ql:all?
+qlfile completion add -> (or http ql git github)
+qlfile completion add http project-name url -> md5-of-url
+qlfile completion add ql -> (or :all project-name)
+qlfile completion add ql :all -> (or :latest list-of-dists)
+qlfile completion add ql project-name -> (or :latest list-of-dists) ;; can filter project related dists?
+qlfile completion add git repo -> (or :ref :branch :tag :name)
+qlfile completion add github owner/ -> list-of-projects
+qlfile completion add github repo -> (or :ref :branch :tag :name)
+|#
